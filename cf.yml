@@ -9,7 +9,7 @@ Parameters:
 
   StationeersImageTag:
     Type: String
-    Description: "(Examples include latest, stable, 0.17, 0.17.33) Refer to tag descriptions available here: https://hub.docker.com/r/hetsh/stationeers/)"
+    Description: "(Examples include latest, 0.2.2549.11996-2) Refer to tag descriptions available here: https://hub.docker.com/r/hetsh/stationeers/)"
     Default: latest
 
   ServerState:
