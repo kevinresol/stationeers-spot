@@ -1,0 +1,697 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Stationeers Spot Price Server via Docker / ECS
+Parameters:
+
+  ECSAMI:
+    Description: AWS ECS AMI ID
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id
+
+  StationeersImageTag:
+    Type: String
+    Description: "(Examples include latest, stable, 0.17, 0.17.33) Refer to tag descriptions available here: https://hub.docker.com/r/hetsh/stationeers/)"
+    Default: latest
+
+  ServerState:
+    Type: String
+    Description: "Running: A spot instance will launch shortly after setting this parameter; your Stationeers server should start within 5-10 minutes of changing this parameter (once UPDATE_IN_PROGRESS becomes UPDATE_COMPLETE). Stopped: Your spot instance (and thus Stationeers container) will be terminated shortly after setting this parameter."
+    Default: Running
+    AllowedValues: 
+    - Running
+    - Stopped
+
+  InstanceType:
+    Type: String
+    Description: "Stationeers requires quite some CPU and RAM, m5.large should be a good start. Change at your discretion. https://aws.amazon.com/ec2/instance-types/."
+    Default: m5.large
+
+  SpotPrice:
+    Type: String
+    Description: "An m3.medium shouldn't cost more than a cent per hour. Note: Leave this blank to use on-demand pricing."
+    Default: "0.05"
+
+  KeyPairName:
+    Type: String
+    Description: (Optional - An empty value disables this feature)
+    Default: ''
+
+  YourIp:
+    Type: String
+    Description: (Optional - An empty value disables this feature)
+    Default: ''
+
+  HostedZoneId:
+    Type: String
+    Description: (Optional - An empty value disables this feature) If you have a hosted zone in Route 53 and wish to set a DNS record whenever your Stationeers instance starts, supply the hosted zone ID here.
+    Default: ''
+
+  RecordName:
+    Type: String
+    Description: (Optional - An empty value disables this feature) If you have a hosted zone in Route 53 and wish to set a DNS record whenever your Stationeers instance starts, supply the name of the record here (e.g. stationeers.mydomain.com).
+    Default: ''
+    
+  WorldType:
+    Type: String
+    Description: World to spawn. Default Moon.
+    Default: Moon
+    AllowedValues:
+    - Moon
+    - Mars
+    - Europa2
+    - Mimas
+    - Vulcan2
+    - Space
+    - Loulan
+
+  EnableRcon:
+    Type: String
+    Description: Refer to https://hub.docker.com/r/hetsh/stationeers/ for further RCON configuration details. This parameter simply opens / closes the port on the security group.
+    Default: false
+    AllowedValues:
+    - true
+    - false
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: 
+          default: Essential Configuration
+        Parameters:
+        - StationeersImageTag
+        - ServerState
+        - InstanceType
+        - SpotPrice
+        - WorldType
+        - EnableRcon
+      - Label: 
+          default: Remote Access (SSH) Configuration (Optional)
+        Parameters:
+        - KeyPairName
+        - YourIp
+      - Label: 
+          default: DNS Configuration (Optional)
+        Parameters:
+        - HostedZoneId
+        - RecordName
+    ParameterLabels:
+      StationeersImageTag:
+        default: "Which version of Stationeers do you want to launch?"
+      ServerState:
+        default: "Update this parameter to shut down / start up your Stationeers server as required to save on cost. Takes a few minutes to take effect."
+      InstanceType:
+        default: "Which instance type? You must make sure this is available in your region! https://aws.amazon.com/ec2/pricing/on-demand/"
+      SpotPrice:
+        default: "Maximum spot price per hour? Leave blank to disable spot pricing."
+      KeyPairName:
+        default: "If you wish to access the instance via SSH, select a Key Pair to use. https://console.aws.amazon.com/ec2/v2/home?#KeyPairs:sort=keyName"
+      YourIp:
+        default: "If you wish to access the instance via SSH, provide your public IP address."
+      HostedZoneId:
+        default: "If you have a hosted zone in Route 53 and wish to update a DNS record whenever your Stationeers instance starts, supply the hosted zone ID here."
+      RecordName:
+        default: "If you have a hosted zone in Route 53 and wish to set a DNS record whenever your Stationeers instance starts, supply a record name here (e.g. stationeers.mydomain.com)."
+      WorldType:
+        default: "Which world do you want to create for a new server?"
+      EnableRcon:
+        default: "Do you wish to enable RCON?"
+
+Conditions:
+  KeyPairNameProvided: !Not [ !Equals [ !Ref KeyPairName, '' ] ]
+  IpAddressProvided: !Not [ !Equals [ !Ref YourIp, '' ] ]
+  DnsConfigEnabled: !And [ !Not [ !Equals [ !Ref HostedZoneId, '' ] ], !Not [ !Equals [ !Ref RecordName, '' ] ] ]
+  SpotPriceProvided: !Not [ !Equals [ !Ref SpotPrice, '' ] ]
+  DoEnableRcon: !Equals [ !Ref EnableRcon, 'true' ]
+
+
+Mappings:
+  ServerState:
+    Running:
+      DesiredCapacity: 1
+    Stopped:
+      DesiredCapacity: 0
+
+Resources:
+
+  # ====================================================
+  # BASIC VPC
+  # ====================================================
+
+  Vpc: 
+    Type: AWS::EC2::VPC
+    Properties: 
+      CidrBlock: 10.100.0.0/26
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select 
+      - 0
+      - !GetAZs 
+        Ref: 'AWS::Region'
+      CidrBlock: !Select [ 0, !Cidr [ 10.100.0.0/26, 4, 4 ] ]
+      VpcId: !Ref Vpc  
+
+  SubnetARoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: 
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref SubnetA
+
+  SubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: 
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref SubnetB  
+
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select 
+      - 1
+      - !GetAZs 
+        Ref: 'AWS::Region'
+      CidrBlock: !Select [ 1, !Cidr [ 10.100.0.0/26, 4, 4 ] ]
+      VpcId: !Ref Vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties: {}
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: 
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref Vpc
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: 
+      VpcId: !Ref Vpc    
+
+  Route:
+    Type: AWS::EC2::Route
+    Properties: 
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref RouteTable
+
+  # ====================================================
+  # EFS FOR PERSISTENT DATA
+  # ====================================================
+
+  Efs:
+    Type: AWS::EFS::FileSystem
+    Properties: {}
+
+  MountA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref Efs
+      SecurityGroups:
+      - !Ref EfsSg
+      SubnetId: !Ref SubnetA
+
+  MountB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref Efs
+      SecurityGroups:
+      - !Ref EfsSg
+      SubnetId: !Ref SubnetB
+
+  EfsSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupName: !Sub "${AWS::StackName}-efs"
+      GroupDescription: !Sub "${AWS::StackName}-efs"
+      SecurityGroupIngress:
+      - FromPort: 2049
+        ToPort: 2049
+        IpProtocol: tcp
+        SourceSecurityGroupId: !Ref Ec2Sg
+      VpcId: !Ref Vpc
+      
+  # ====================================================
+  # INSTANCE CONFIG
+  # ====================================================
+
+  Ec2Sg:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupName: !Sub "${AWS::StackName}-ec2"
+      GroupDescription: !Sub "${AWS::StackName}-ec2"
+      SecurityGroupIngress:
+      - !If
+        - IpAddressProvided 
+        - FromPort: 22
+          ToPort: 22
+          IpProtocol: tcp
+          CidrIp: !Sub "${YourIp}/32"
+        - !Ref 'AWS::NoValue'
+      - FromPort: 27500
+        ToPort: 27500
+        IpProtocol: udp
+        CidrIp: 0.0.0.0/0
+      - FromPort: 27015
+        ToPort: 27015
+        IpProtocol: udp
+        CidrIp: 0.0.0.0/0
+      - !If
+        - DoEnableRcon
+        - FromPort: 27500
+          ToPort: 27500
+          IpProtocol: tcp
+          CidrIp: 0.0.0.0/0
+        - !Ref 'AWS::NoValue'
+      VpcId: !Ref Vpc
+
+  LaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      AssociatePublicIpAddress: true
+      IamInstanceProfile: !Ref InstanceProfile
+      ImageId: !Ref ECSAMI
+      InstanceType: !Ref InstanceType
+      KeyName: 
+        !If [ KeyPairNameProvided, !Ref KeyPairName, !Ref 'AWS::NoValue' ]
+      SecurityGroups:
+      - !Ref Ec2Sg
+      SpotPrice: !If [ SpotPriceProvided, !Ref SpotPrice, !Ref 'AWS::NoValue' ]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum install -y amazon-efs-utils
+          mkdir /opt/stationeers
+          mount -t efs ${Efs}:/ /opt/stationeers
+          chown 1358:1358 /opt/stationeers
+          echo ECS_CLUSTER=${EcsCluster} >> /etc/ecs/ecs.config
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+    - MountA
+    - MountB
+    Properties:
+      AutoScalingGroupName: !Sub "${AWS::StackName}-asg"
+      DesiredCapacity: !FindInMap [ ServerState, !Ref ServerState, DesiredCapacity ]
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      MaxSize: !FindInMap [ ServerState, !Ref ServerState, DesiredCapacity ]
+      MinSize: !FindInMap [ ServerState, !Ref ServerState, DesiredCapacity ]
+      VPCZoneIdentifier:
+        - !Ref SubnetA
+        - !Ref SubnetB
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+      Policies:
+        - PolicyName: root
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement: 
+              - Effect: "Allow"
+                Action: "route53:*"
+                Resource: "*"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Roles:
+        - !Ref InstanceRole
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+
+  EcsService:
+    Type: AWS::ECS::Service
+    Properties: 
+      Cluster: !Ref EcsCluster
+      DesiredCount: !FindInMap [ ServerState, !Ref ServerState, DesiredCapacity ]
+      ServiceName: !Sub "${AWS::StackName}-ecs-service"
+      TaskDefinition: !Ref EcsTask  
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+
+  EcsTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties: 
+      Volumes:
+      - Host:
+          SourcePath: /opt/stationeers
+        Name: stationeers
+      ContainerDefinitions:      
+        - Name: stationeers
+          MemoryReservation: 1024
+          Image: !Sub "hetsh/stationeers:${StationeersImageTag}"
+          Environment:
+          - Name: WORLD_TYPE
+            Value: !Ref WorldType
+          PortMappings:
+          - ContainerPort: 27500
+            HostPort: 27500
+            Protocol: udp
+          - ContainerPort: 27500
+            HostPort: 27500
+            Protocol: tcp
+          - ContainerPort: 27015
+            HostPort: 27015
+            Protocol: udp
+          MountPoints:
+          - ContainerPath: /stationeers
+            SourceVolume: stationeers
+            ReadOnly: false
+
+  # ====================================================
+  # SET DNS RECORD
+  # ====================================================
+
+  SetDNSRecordLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: DnsConfigEnabled
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement: 
+              - Effect: "Allow"
+                Action: "route53:*"
+                Resource: "*"
+              - Effect: "Allow"
+                Action: "ec2:DescribeInstance*"
+                Resource: "*"
+
+  SetDNSRecordLambda:
+    Type: "AWS::Lambda::Function"
+    Condition: DnsConfigEnabled
+    Properties: 
+      Environment:
+        Variables:
+          HostedZoneId: !Ref HostedZoneId
+          RecordName: !Ref RecordName
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          def handler(event, context):
+            new_instance = boto3.resource('ec2').Instance(event['detail']['EC2InstanceId'])
+            boto3.client('route53').change_resource_record_sets(
+              HostedZoneId= os.environ['HostedZoneId'],
+              ChangeBatch={
+                  'Comment': 'updating',
+                  'Changes': [
+                      {
+                          'Action': 'UPSERT',
+                          'ResourceRecordSet': {
+                              'Name': os.environ['RecordName'],
+                              'Type': 'A',
+                              'TTL': 60,
+                              'ResourceRecords': [
+                                  {
+                                      'Value': new_instance.public_ip_address
+                                  },
+                              ]
+                          }
+                      },
+                  ]
+              })
+      Description: Sets Route 53 DNS Record for Stationeers
+      FunctionName: !Sub "${AWS::StackName}-set-dns"
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt SetDNSRecordLambdaRole.Arn
+      Runtime: python3.7
+      Timeout: 20
+
+  LaunchEvent:
+    Type: AWS::Events::Rule
+    Condition: DnsConfigEnabled
+    Properties: 
+      EventPattern:
+        source:
+        - aws.autoscaling
+        detail-type:
+        - EC2 Instance Launch Successful
+        detail:
+          AutoScalingGroupName:
+          - !Ref AutoScalingGroup
+      Name: !Sub "${AWS::StackName}-instance-launch"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SetDNSRecordLambda.Arn
+          Id: !Sub "${AWS::StackName}-set-dns"
+
+  LaunchEventLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: DnsConfigEnabled
+    Properties: 
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt SetDNSRecordLambda.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt LaunchEvent.Arn
+      
+
+  # ====================================================
+  # Web API to start/stop the server
+  # ====================================================
+    
+  ApiGatewayRestApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      ProtocolType: HTTP
+      Description: An API Gateway with a Lambda Integration
+      Name: stationeers-cf-api
+
+  ApiGatewayStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      DeploymentId: !Ref ApiGatewayDeployment
+      Description: Lambda API Stage v0
+      ApiId: !Ref ApiGatewayRestApi
+      StageName: v0
+
+  ApiGatewayIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ""
+            Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: LambdaAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:*
+                Resource:
+                - !GetAtt GetStatusLambdaFunction.Arn
+                - !GetAtt SetStatusLambdaFunction.Arn
+
+  LambdaIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MyAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                - cloudformation:*
+                Resource:
+                - !Ref AWS::StackId
+              - Effect: Allow
+                Action:
+                - ec2:*
+                - ecs:*
+                - autoscaling:*
+                - ssm:*
+                - iam:*
+                Resource: "*"
+
+  GetStatusLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          exports.handler = function(event) {
+            const aws = require('aws-sdk')
+            const cf = new aws.CloudFormation();
+            const ec2 = new aws.EC2();
+            const stackId = process.env['STACK_ID'];
+            return Promise.all([
+              cf.describeStacks({StackName: stackId}).promise(),
+              ec2.describeInstances({Filters: [{Name: "tag:aws:cloudformation:stack-id", Values: [stackId]}]}).promise(),
+            ]).then(data => {
+              const status = data[0].Stacks[0].Parameters.find(v => v.ParameterKey == 'ServerState').ParameterValue;
+              let ip;
+              
+              if(status == 'Running')
+                for(const reservation of data[1].Reservations)
+                  for(const instance of reservation.Instances)
+                    if(instance.PublicIpAddress) ip = instance.PublicIpAddress;
+                  
+              return {status, ip}
+            });
+          }
+      Environment:
+        Variables:
+          STACK_ID: !Ref AWS::StackId
+      Description: Lambda function for getting server status
+      FunctionName: get-status-lambda-function
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt LambdaIamRole.Arn
+      Runtime: nodejs12.x
+      Timeout: 10
+
+  GetStatusApiGatewayRoute:
+    Type: AWS::ApiGatewayV2::Route
+    DependsOn:
+      - ApiGatewayRestApi
+      - GetStatusApiGatewayIntegration
+      - GetStatusLambdaFunction
+    Properties:
+      ApiId: !Ref ApiGatewayRestApi
+      RouteKey: GET /status
+      Target: !Join
+        - /
+        - - integrations
+          - !Ref GetStatusApiGatewayIntegration
+          
+  GetStatusApiGatewayIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGatewayRestApi
+      Description: Test Integration
+      ConnectionType: INTERNET
+      CredentialsArn: !GetAtt ApiGatewayIamRole.Arn
+      PassthroughBehavior: WHEN_NO_MATCH
+      TimeoutInMillis: 10000
+      IntegrationMethod: POST
+      IntegrationType: AWS_PROXY
+      PayloadFormatVersion: "2.0"
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetStatusLambdaFunction.Arn}/invocations"
+      
+  SetStatusLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          exports.handler = function(event) {
+            const aws = require('aws-sdk')
+            const cf = new aws.CloudFormation();
+            const stackId = process.env['STACK_ID'];
+            if(!event.queryStringParameters || !event.queryStringParameters.value) return Promise.resolve('Missing query, expected value=Running or value=Stopped');
+            const value = event.queryStringParameters.value;
+            if(value != 'Running' && value != 'Stopped') return Promise.resolve('Invalid value, expected Running or Stopped');
+            return cf.updateStack({
+              StackName: stackId,
+              UsePreviousTemplate: true,
+              Capabilities: ['CAPABILITY_IAM'],
+              Parameters: [{ParameterKey: 'ServerState', ParameterValue: value}],
+            }).promise().then(() => 'Updated stack status to ' + value + ' successfully');
+          }
+      Environment:
+        Variables:
+          STACK_ID: !Ref AWS::StackId
+      Description: Lambda function for setting server status
+      FunctionName: set-status-lambda-function
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt LambdaIamRole.Arn
+      Runtime: nodejs12.x
+      Timeout: 10
+
+  SetStatusApiGatewayRoute:
+    Type: AWS::ApiGatewayV2::Route
+    DependsOn:
+      - ApiGatewayRestApi
+      - SetStatusApiGatewayIntegration
+      - SetStatusLambdaFunction
+    Properties:
+      ApiId: !Ref ApiGatewayRestApi
+      RouteKey: POST /status
+      Target: !Join
+        - /
+        - - integrations
+          - !Ref SetStatusApiGatewayIntegration
+          
+  SetStatusApiGatewayIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGatewayRestApi
+      Description: Set Stack Status
+      ConnectionType: INTERNET
+      CredentialsArn: !GetAtt ApiGatewayIamRole.Arn
+      PassthroughBehavior: WHEN_NO_MATCH
+      TimeoutInMillis: 10000
+      IntegrationMethod: POST
+      IntegrationType: AWS_PROXY
+      PayloadFormatVersion: "2.0"
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SetStatusLambdaFunction.Arn}/invocations"
+  
+  ApiGatewayDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - GetStatusApiGatewayRoute
+      - SetStatusApiGatewayRoute
+    Properties:
+      Description: Lambda API Deployment
+      ApiId: !Ref ApiGatewayRestApi
+  ########
+
+Outputs:
+  CheckInstanceIp:
+    Description: To find your Stationeers instance IP address, visit the following link. Click on the instance to find its Public IP address.
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/ec2/v2/home?region=${AWS::Region}#Instances:tag:aws:autoscaling:groupName=${AutoScalingGroup};sort=tag:Name"
+    
+  ApiGatewayInvokeURL:
+    Value: !Sub "https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/v0/status"
