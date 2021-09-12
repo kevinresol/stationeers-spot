@@ -63,6 +63,11 @@ Parameters:
     - Space
     - Loulan
 
+  ServerPassword:
+    Type: String
+    Description: "Server password"
+    Default: ''
+
   EnableRcon:
     Type: String
     Description: Refer to https://hub.docker.com/r/hetsh/stationeers/ for further RCON configuration details. This parameter simply opens / closes the port on the security group.
@@ -82,6 +87,7 @@ Metadata:
         - InstanceType
         - SpotPrice
         - WorldType
+        - ServerPassword
         - EnableRcon
       - Label: 
           default: Remote Access (SSH) Configuration (Optional)
@@ -112,6 +118,8 @@ Metadata:
         default: "If you have a hosted zone in Route 53 and wish to set a DNS record whenever your Stationeers instance starts, supply a record name here (e.g. stationeers.mydomain.com)."
       WorldType:
         default: "Which world do you want to create for a new server?"
+      ServerPassword:
+        default: "Set a server password"
       EnableRcon:
         default: "Do you wish to enable RCON?"
 
@@ -362,6 +370,8 @@ Resources:
           Environment:
           - Name: WORLD_TYPE
             Value: !Ref WorldType
+          - Name: SERVER_OPTS
+            Value: !Sub "-password=${ServerPassword}"
           PortMappings:
           - ContainerPort: 27500
             HostPort: 27500
