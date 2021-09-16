@@ -379,7 +379,7 @@ Resources:
           - Name: WORLD_TYPE
             Value: !Ref WorldType
           - Name: SERVER_OPTS
-            Value: !Sub '-password="${ServerPassword}" -servername="${ServerName}"'
+            Value: !Sub '-password=${ServerPassword} -servername="${ServerName}"'
           PortMappings:
           - ContainerPort: 27500
             HostPort: 27500
