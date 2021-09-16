@@ -63,6 +63,11 @@ Parameters:
     - Space
     - Loulan
 
+  ServerName:
+    Type: String
+    Description: "Server name"
+    Default: 'Stationeers'
+
   ServerPassword:
     Type: String
     Description: "Server password"
@@ -87,6 +92,7 @@ Metadata:
         - InstanceType
         - SpotPrice
         - WorldType
+        - ServerName
         - ServerPassword
         - EnableRcon
       - Label: 
@@ -118,6 +124,8 @@ Metadata:
         default: "If you have a hosted zone in Route 53 and wish to set a DNS record whenever your Stationeers instance starts, supply a record name here (e.g. stationeers.mydomain.com)."
       WorldType:
         default: "Which world do you want to create for a new server?"
+      ServerName:
+        default: "Set a server name"
       ServerPassword:
         default: "Set a server password"
       EnableRcon:
@@ -371,7 +379,7 @@ Resources:
           - Name: WORLD_TYPE
             Value: !Ref WorldType
           - Name: SERVER_OPTS
-            Value: !Sub "-password=${ServerPassword}"
+            Value: !Sub '-password="${ServerPassword}" -servername="${ServerName}"'
           PortMappings:
           - ContainerPort: 27500
             HostPort: 27500
@@ -580,22 +588,24 @@ Resources:
               cf.describeStacks({StackName: stackId}).promise(),
               ec2.describeInstances({Filters: [{Name: "tag:aws:cloudformation:stack-id", Values: [stackId]}]}).promise(),
             ]).then(data => {
-              const status = data[0].Stacks[0].Parameters.find(v => v.ParameterKey == 'ServerState').ParameterValue;
+              const stack = data[0].Stacks[0];
+              const state = stack.Parameters.find(v => v.ParameterKey == 'ServerState').ParameterValue;
+              const status = stack.StackStatus;
               let ip;
               
-              if(status == 'Running')
+              if(state == 'Running')
                 for(const reservation of data[1].Reservations)
                   for(const instance of reservation.Instances)
                     if(instance.PublicIpAddress) ip = instance.PublicIpAddress;
                   
-              return {status, ip}
+              return {state, ip, status}
             });
           }
       Environment:
         Variables:
           STACK_ID: !Ref AWS::StackId
       Description: Lambda function for getting server status
-      FunctionName: get-status-lambda-function
+      FunctionName: !Sub "${AWS::StackName}-get-status"
       Handler: index.handler
       MemorySize: 128
       Role: !GetAtt LambdaIamRole.Arn
@@ -635,25 +645,33 @@ Resources:
     Properties:
       Code:
         ZipFile: |
-          exports.handler = function(event) {
+          exports.handler = async function(event) {
             const aws = require('aws-sdk')
             const cf = new aws.CloudFormation();
             const stackId = process.env['STACK_ID'];
-            if(!event.queryStringParameters || !event.queryStringParameters.value) return Promise.resolve('Missing query, expected value=Running or value=Stopped');
+            if(!event.queryStringParameters || !event.queryStringParameters.value) return 'Missing query, expected value=Running or value=Stopped';
             const value = event.queryStringParameters.value;
-            if(value != 'Running' && value != 'Stopped') return Promise.resolve('Invalid value, expected Running or Stopped');
-            return cf.updateStack({
+            if(value != 'Running' && value != 'Stopped') return 'Invalid value, expected Running or Stopped';
+            const stacks = await cf.describeStacks({StackName: stackId}).promise();
+            const params = stacks.Stacks[0].Parameters;
+            await cf.updateStack({
               StackName: stackId,
               UsePreviousTemplate: true,
               Capabilities: ['CAPABILITY_IAM'],
-              Parameters: [{ParameterKey: 'ServerState', ParameterValue: value}],
-            }).promise().then(() => 'Updated stack status to ' + value + ' successfully');
+              Parameters: [{ParameterKey: 'ServerState', ParameterValue: value}]
+              .concat(
+                params
+                .filter(p => p.ParameterKey != 'ServerState')
+                .map(p => ({ParameterKey: p.ParameterKey, UsePreviousValue: true}))
+                )
+            }).promise();
+            return 'Updated stack status to ' + value + ' successfully';
           }
       Environment:
         Variables:
           STACK_ID: !Ref AWS::StackId
       Description: Lambda function for setting server status
-      FunctionName: set-status-lambda-function
+      FunctionName: !Sub "${AWS::StackName}-set-status"
       Handler: index.handler
       MemorySize: 128
       Role: !GetAtt LambdaIamRole.Arn
